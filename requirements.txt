@@ -1,0 +1,8 @@
+langchain 
+langchain_community 
+tiktoken 
+langchainhub
+langgraph 
+langchain_openai
+langchain-chroma
+unstructured
