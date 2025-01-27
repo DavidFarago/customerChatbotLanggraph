@@ -30,8 +30,9 @@ Else increase loop counter and go to 6.
 If issue tracker item needed, goto 11, else goto 12.
 11. Create an issue tracker item, send the customer a reply with the item ID, and go to 12.
 12. If there is an issue item: {store all information in the issue item}. Terminate.
-
 """
+
+
 #%%
 from enum import Enum
 import os
@@ -88,6 +89,7 @@ classification_sys_msg_prefix = """You are an expert customer message classifica
 8. Issue tracker item detection: whether there is resp. should be an issue tracker item.
 """
 
+
 #%%
 print("# Expectation detection")
 
@@ -114,6 +116,7 @@ def get_messages_str(messages: List[str]) -> str:
 messages = [f"Customer message: {initial_customer_messages[0]}"] # part of graph state
 print("Starting off with customer message: {initial_customer_messages[0]}")
 print(expectation_classifier_chain.invoke({"messages": get_messages_str(messages)}))
+
 
 #%%
 print("# Create queries or keywords")
@@ -152,6 +155,7 @@ alternative_queries = alternative_queries_chain.invoke({
     "previous_queries": get_optional_previous_queries_str(previous_queries),
 }) # part of graph state
 print(alternative_queries)
+
 
 #%%
 print("# Retrieve chunks")
@@ -199,6 +203,7 @@ for query in [get_last_customer_message_str(messages)] + alternative_queries.que
 chunks: ChunkArray = {chunk.page_content for chunk in chunks_collector} # part of graph state
 print(f"Retrieved {len(chunks)} chunks: {chunks}")
 
+
 #%%
 print("# Missing info detection")
 
@@ -229,6 +234,7 @@ missing_customer_info = missing_info_classifier_chain.invoke({
     "chunks": get_chunks_str(chunks)
 }) # part of graph state
 print(missing_customer_info)
+
 
 #%%
 print("# Write response draft")
@@ -262,6 +268,7 @@ response_draft = response_draft_chain.invoke({
     "unhelpfulness_reason": "",
 }) # part of graph state
 print(response_draft)
+
 
 #%%
 print("# Helpfulness detection")
@@ -314,6 +321,7 @@ helpfulness_classification = helpfulness_classifier_chain.invoke({
 })
 print(helpfulness_classification)
 
+
 #%%
 print("# Manual intervention detection")
 
@@ -347,6 +355,7 @@ print(intervention_classifier_chain.invoke({
     "response_draft": get_response_draft_str(response_draft),
     "unhelpfulness_reason": get_unhelpful_reason_str(helpfulness_classification),
 }))
+
 
 #%%
 print("# Issue tracker item detection TODO")
