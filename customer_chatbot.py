@@ -1,7 +1,7 @@
 """# Customer Chatbot Flow
 
 Respond to new customer message:
-1. messages = [new customer message] # list of Customer message or MediVoice message
+1. wait for new customer message. Upon new customer message or timeout, go to 2.
 2. expectation detection based on messages:
   * "response needed"
   * "no response needed".
@@ -12,7 +12,7 @@ If "no response needed", go to 10, else go to 3.
 5. missing info detection based on the data:
   * "needs further customer info",
   * "sufficient customer info".
-6. use messages, retrieved chunks and missing info detection output = (and possibly helpfulness critique) to write a draft reply
+6. use messages, retrieved chunks and missing info detection output (and possibly previous draft and helpfulness critique) to write a draft reply
 7. check draft reply for helpfulness: is the draft reply helpfull in moving the problem forward (e.g. by answering the customer inquery or by asking the customer for further information that will help move the problem forward)?
   * No: store helpfulness critique and goto 8.
   * Yes: go to 9.
@@ -20,11 +20,11 @@ If "no response needed", go to 10, else go to 3.
   * "human needed"
   * "no human needed"
 
-If human needed or loop counter > RETRIES: go to 11.
+If human needed or loop counter > RETRIES: go to 10.
 Else increase loop counter and go to 6.
-9. Respond to the customer with the generated message and wait for new customer message. Upon new customer message or timeout, go to 2.
+9. Respond to the customer with the generated message and go to 1 
 10. issue tracker item detection:
-  * "issue tracker item needed": there should be an issue tracker item, but is not yet
+  * "issue tracker item needed": there should be an issue tracker item (e.g. because a MediVoice employer needs to get involved), but is not yet
   * "no issue tracker item needed": it is not worth to create an issue tracker item for these messages, or an issue tracker tem is already present in the messages.
 
 If issue tracker item needed, goto 11, else goto 12.
@@ -34,20 +34,52 @@ If issue tracker item needed, goto 11, else goto 12.
 
 
 #%%
+from dotenv import load_dotenv
 from enum import Enum
+import operator
 import os
-from typing import Annotated, List
 from pydantic import BaseModel, Field
+from typing import Annotated, List
 
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from langchain.prompts import PromptTemplate
+from langchain.globals import set_debug
 
-TOP_K_FUSION_QUERIES = 3
-TOP_K_CHUNKS = 3
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
-RETRIES = 3
+load_dotenv()
+
+def get_config_value(key: str, default, cast_func=str):
+    raw_value = os.getenv(key)
+    if raw_value is None:
+        result = default
+    else:
+        try:
+            result = cast_func(raw_value)
+        except Exception as e:
+            raise ValueError(f"Invalid value for {key}: {raw_value}. Error: {e}")
+    print(f"Value of {key}: {result}")
+    return result
+
+str_to_bool = lambda s: s.lower() in ['true', '1', 'yes', 'y']
+
+# hyper parameters:
+TOP_K_FUSION_QUERIES = get_config_value("TOP_K_FUSION_QUERIES", 3, int)
+TOP_K_CHUNKS = get_config_value("TOP_K_CHUNKS", 3, int)
+CHUNK_SIZE = get_config_value("CHUNK_SIZE", 1000, int) 
+CHUNK_OVERLAP = get_config_value("CHUNK_OVERLAP", 200, int)
+RETRIES = get_config_value("RETRIES", 3, int)
+
+# tracing:
+DEBUG = get_config_value("DEBUG", False, str_to_bool)
+LANGSMITH_TRACING    = get_config_value("LANGSMITH_TRACING", DEBUG, str_to_bool)
+LANGSMITH_ENDPOINT   = get_config_value("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com", str)
+LANGSMITH_API_KEY = get_config_value("LANGSMITH_API_KEY", "get_it_at_smith.langchain.com", str)
+LANGSMITH_PROJECT = "customer_chatbot"
+LANGCHAIN_TRACING_V2 = get_config_value("LANGCHAIN_TRACING_V2", DEBUG, str_to_bool)
+LANGCHAIN_ENDPOINT = get_config_value("LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com", str)
+LANGCHAIN_API_KEY = get_config_value("LANGCHAIN_API_KEY", LANGSMITH_API_KEY, str)
+LANGGRAPH_STUDIO = get_config_value("LANGGRAPH_STUDIO", False, str_to_bool)
+
+set_debug(DEBUG)
 
 llm = ChatOpenAI(
     model="gpt-4o-mini",
@@ -59,12 +91,18 @@ llm = ChatOpenAI(
 
 initial_customer_messages = [
     "Why is my phone assistant not offering any appointments in Febuary?",
+    # "I used the default settings, so I think this is a bug in your system. Please investigate and get back to me!"
+    # "Never mind, I made a mistake. Sorry for the confusion."
     "How do I configure multiple locations for my practice?",
+    "Wie kann ich mehrere Standorte für meine Praxis konfigurieren?",
     "Can I configure my assistant to understand Spanish besides German?",
+    "Kann ich meinen Assistenten so konfigurieren, dass er neben Deutsch auch Spanisch versteht?"
     "Your system is great, keep up the good work!",
     "We stopped using your assistant and canceled our contract with MediVoice. Goodbye.",
     "I have a bug report: Your assistant does not schedule appointments on Sundays, even though I configured slots for Sundays.",
+    "Ich habe einen Fehler zu melden: Der Assistent vergibt keine Termine an Sonntagen, obwohl ich Slots für Sonntage konfiguriert habe.",
     "I get back different names for the same person, in the same call :-0",
+    "Ich bekomme unterschiedliche Namen für die gleiche Person, im selben Anruf :-0"
 ]
 
 customer_service_sys_msg_prefix = """
@@ -94,7 +132,7 @@ classification_sys_msg_prefix = """You are an expert customer message classifica
 print("# Expectation detection")
 
 class ExpectationClasses(str, Enum):
-    NEEDS = "response needed"
+    NEEDS_RESPONSE = "response needed"
     NO_RESPONSE = "no response needed"
 class ExpectationClassification(BaseModel):
     explanation: str = Field(description="An explanation for the classification result")
@@ -113,8 +151,8 @@ def get_messages_str(messages: List[str]) -> str:
     return '\n'.join(messages)
 
 # exemplary use of expectation_classifier_chain:
-messages = [f"Customer message: {initial_customer_messages[0]}"] # part of graph state
-print("Starting off with customer message: {initial_customer_messages[0]}")
+messages = [f"Customer message: {initial_customer_messages[-1]}"] # part of graph state
+print(f"Starting off with customer message: {initial_customer_messages[-1]}")
 print(expectation_classifier_chain.invoke({"messages": get_messages_str(messages)}))
 
 
@@ -128,10 +166,10 @@ structured_llm = llm.with_structured_output(AlternativeQueries, method="json_sch
 
 create_queries_keywords_sys_msg = ("system", customer_service_sys_msg_prefix + """
     You are a RAG fusion expert, i.e. a master at creating alternative queries/keywords that are related to the information you will be provided: a customer message and possibly earlier alternative queries/keywords.
-    Create alternative queries/keywords that rephrase the provided customer message to perfect the retrieval of chunks relevant to the provided customer message from a vector database.
+    Create {number_queries} alternative queries/keywords that rephrase the provided customer message to perfect the retrieval of chunks relevant to the provided customer message from a vector database.
 
-    First think step by step to work out the best alternative queries/keywords that are closely related to the customer message (and possibly earlier alternative queries/keywords) provided below, to increase the relevance of the retrieved chunks for the provided customer message.
-    Each alternative can be a query or a keyword, whatever you think is better. The provided customer message and each of your generated alternative queries/keywords will be used separately to retrieve relevant chunks from a vector database.
+    First think step by step to work out the best {number_queries} alternative queries/keywords that are closely related to the customer message (and possibly earlier alternative queries/keywords) provided below, to increase the relevance of the retrieved chunks for the provided customer message.
+    Each alternative can be a query or a keyword, whatever you think is better. The provided customer message and each of your {number_queries} generated alternative queries/keywords will be used separately to retrieve relevant chunks from a vector database.
 
     Generate a JSON with the keys
     * `explanation` for your step by step thought on what the best 3 alternative queries or keywords are
@@ -149,19 +187,23 @@ def get_optional_previous_queries_str(previous_queries: AlternativeQueries) -> s
 
 # exemplary use of alternative_queries_chain:
 previous_queries: AlternativeQueries = None
-alternative_queries = alternative_queries_chain.invoke({
-    "number_queries": TOP_K_FUSION_QUERIES,
-    "last_customer_message": get_last_customer_message_str(messages),
-    "previous_queries": get_optional_previous_queries_str(previous_queries),
-}) # part of graph state
-print(alternative_queries)
+if TOP_K_FUSION_QUERIES  == 0:
+    print("No queries needed")
+    alternative_queries = AlternativeQueries(explanation="", queries=[]) # part of graph state
+else:    
+    alternative_queries = alternative_queries_chain.invoke({
+        "number_queries": TOP_K_FUSION_QUERIES,
+        "last_customer_message": get_last_customer_message_str(messages),
+        "previous_queries": get_optional_previous_queries_str(previous_queries),
+    }) # part of graph state
+    print(f"Alternative {TOP_K_FUSION_QUERIES} queries:")
+    print(alternative_queries)
 
 
 #%%
 print("# Retrieve chunks")
 
 from langchain_community.document_loaders import UnstructuredMarkdownLoader
-from langchain_core.documents import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
@@ -190,17 +232,40 @@ openai_embeddings = OpenAIEmbeddings(
 print(f"Splittet into {len(texts)} chunks")
 
 from langchain_chroma import Chroma
+import shutil
 persist_directory = 'db'
+if os.path.exists(persist_directory):
+    shutil.rmtree(persist_directory)
 vectordb = Chroma.from_documents(documents=texts,
                                  embedding=openai_embeddings,
                                  persist_directory=persist_directory)
-retriever = vectordb.as_retriever(search_kwargs={"k": TOP_K_CHUNKS})
+#like retriever = vectordb.as_retriever(search_kwargs={"k": TOP_K_CHUNKS}), but includes similarity scores:
+from langchain_core.documents import Document
+from langchain_core.runnables import chain
+@chain
+def retriever(query: str) -> List[Document]:
+    docs, scores = zip(*vectordb.similarity_search_with_score(query, k=TOP_K_CHUNKS))
+    for doc, score in zip(docs, scores):
+        doc.metadata["score"] = score
+    return docs
+
+def get_unique_sorted_documents(docs):
+    unique = {}
+    for doc in docs:
+        content = doc.page_content
+        score = doc.metadata.get("score", 0)
+        if content not in unique or score > unique[content].metadata.get("score", 0):
+            unique[content] = doc
+    sorted_docs = sorted(unique.values(), key=lambda d: d.metadata.get("score", 0), reverse=True)
+    return [doc.page_content for doc in sorted_docs]
 
 # exemplary use of chunk:
 chunks_collector = []
 for query in [get_last_customer_message_str(messages)] + alternative_queries.queries:
-    chunks_collector.extend(retriever.invoke(query))
-chunks: ChunkArray = {chunk.page_content for chunk in chunks_collector} # part of graph state
+    new_chunks = retriever.invoke(query[18:])
+    chunks_collector.extend(new_chunks)
+print(f"Retrieved {len(chunks_collector)} chunks in total: {chunks_collector}")
+chunks: ChunkArray = get_unique_sorted_documents(chunks_collector) # part of graph state
 print(f"Retrieved {len(chunks)} chunks: {chunks}")
 
 
@@ -301,13 +366,16 @@ def get_earlier_response_draft_str(response_draft: ResponseDraft) -> str:
     return f'\nEarlier response draft: {response_draft.responseDraft}'
 
 def get_unhelpful_reason_str(helpfulness_classification: HelpfulnessClassification) -> str:
-    assert helpfulness_classification.category == HelpfulnessClasses.NOT_HELPFUL
+    if not helpfulness_classification or helpfulness_classification.category == HelpfulnessClasses.HELPFUL:
+        return ''
     return f'\nReasoning why the draft is not helpful: {helpfulness_classification.explanation}'
 
 def get_helpfulness_classification_str(helpfulness_classification: HelpfulnessClassification) -> str:
     return f'\nHelpfulness verdict: {repr(helpfulness_classification.category)}\nHelpfulness explanation: {helpfulness_classification.explanation}'
 
 def get_response_draft_str(response_draft: ResponseDraft) -> str:
+    if not response_draft:
+        return ''
     return f'\nResponseDraft: {response_draft.responseDraft}\nResponseDraft explanation: {response_draft.explanation}'
 
 print(get_response_draft_str(response_draft))
@@ -362,104 +430,195 @@ print("# Issue tracker item detection TODO")
 
 
 #%%
-"""## State"""
+print("\n# Building and executing the langGraph\n")
 
-from langchain.schema import Document
+# TODO: syntactically simplify conditional edges
+
+# TODO: Build this as an agent, as in AI-Agents-In-LangGraph course
+
+# TODO: Use ConversationChain for better modularity? 
+
+# The langGraph state
 from langgraph.graph import END, StateGraph
-
+from langgraph.errors import NodeInterrupt
 from typing_extensions import TypedDict
-from typing import List
-
-### State
 
 class GraphState(TypedDict):
-    messages : List[str] # each is a customer message or MediVoice response
-    alternativeQueries: AlternativeQueries
-    chunks: Annotated[List[str], TOP_K_CHUNKS]
-    enoughCustomerInfo: CustomerInfoClassification
-    num_steps: Annotated[int, TOP_K_CHUNKS]
-    draft_email_feedback : dict
-
-"""## Nodes
-
-1. categorize_message
-2. rag  
-3. draft_message_writer  
-4. analyze_draft_message  
-5. rewrite_message  
-6. no_rewrite  
-7. state_printer
-
-
-0. read initial customer message, loop_counter = 0
-conditional edge with expectation detection: expectation_classifier_chain
-1. query_rewriting_chain
-2. rag_chain
-3. missing_info_classifier_chain
-4. response_draft_chain
-conditional edge with helpfulness detection: helpfulness_classifier_chain
-conditional edge with manual intervention detection: intervention_classifier_chain
-5. increase loop_counter
-6. issue_tracker_classifier_chain
-7. send message, loop_counter = 0
-8. create issue tracker item
-9. fill issue tracker item
-"""
-
-def categorize_message_expectation(state):
-    """take the initial customer message and categorize it"""
-    print("# Categorize message expectation")
-
-    # get the state
-    # invoke the chain
-    # print
-    # save to local disk
-    return {"message_category": message_category}
-
-"""## Conditional Edges"""
-
-def route_to_response_draft_generation(state):
-    """
-    Route back to draft a response to teh customer.
-    """
-
-    # get state
-    # invoke the classification chain
-    # print classification result
-    if result.category == "response needed":
-        print("route to response draft generation")
-        return "draft_response_node"
-    else: 
-        print("route to send message")
-        return "send_message_node"
-
-"""## Build the Graph
-
-### Add Nodes
-"""
-
+    messages : Annotated[list[str], operator.add] # each is a customer message or MediVoice response
+    expectation_classification: ExpectationClassification
+    alternative_queries: AlternativeQueries
+    chunks: ChunkArray
+    missing_customer_info: CustomerInfoClassification
+    response_draft: ResponseDraft
+    helpfulness_classification: HelpfulnessClassification
+    intervention_classification: InterventionClassification
+    tries: Annotated[int, RETRIES]
 graph = StateGraph(GraphState)
 
-graph.add_node("categorize_message", categorize message) 
-# TODO ...
+# The langGraph nodes and edges
+"""
+0. receive_customer_message
+conditional edge with expectation detection: expectation_classifier_chain
+1. rewrite_query
+2. get_chunks
+3. classify_missing_info
+4. draft_response
+conditional edge with helpfulness detection: helpfulness_classifier_chain
+conditional edge with manual intervention detection: intervention_classifier_chain
+5. send_message
+6. increase loop_counter
+7. issue_tracker_classifier
+8. send message, loop_counter = 0
+9. create issue tracker item
+10. fill issue tracker item
+"""
 
-"""### Add Edges"""
+def receive_customer_message(_state: GraphState):
+    if LANGGRAPH_STUDIO:
+        return {} # message will be appended to `messages` in the studio
+    customer_message = input("Receive customer message: ")
+    return {"messages": [f"Customer message: {customer_message}"], "tries": 0}
 
-graph.set_entry_point("initial_customer_message")
+graph.add_node("receive_customer_message", receive_customer_message) 
+graph.set_entry_point("receive_customer_message")
+
+def classify_expectation(state: GraphState):
+    expectation_classification_result = expectation_classifier_chain.invoke({"messages": get_messages_str(state["messages"])})
+    print(f"Classified expectation: {expectation_classification_result.category}")
+    return {"expectation_classification": expectation_classification_result}
+
+graph.add_node("classify_expectation", classify_expectation)
+graph.add_edge("receive_customer_message", "classify_expectation")
 
 graph.add_conditional_edges(
-    "response needed",
-    route_to_response_draft_generation,
+    "classify_expectation",
+    lambda state: "classify_issue_tracker_item" if state["expectation_classification"].category == ExpectationClasses.NO_RESPONSE else "rewrite_query",
     {
-        "route to response draft generation": "draft_response_node",
-        "route to send message": "send_message_node",
+        "classify_issue_tracker_item": "classify_issue_tracker_item",
+        "rewrite_query": "rewrite_query",
     },
 )
-graph.add_edge("send_message_node", "issue_tracker_node")
 
-app = graph.compile()
-inputs = {"initial_message": initial_customer_messages[0],"draft": None}
-for output in app.stream(inputs):
-    for key, value in output.items():
-        print(f"Finished running: {key}:")
-print(app.invoke(inputs))
+def rewrite_query(state: GraphState):
+    if TOP_K_FUSION_QUERIES == 0:
+        print("No queries needed")
+        return {"alternative_queries": None}
+    alternative_queries = alternative_queries_chain.invoke({
+        "number_queries": TOP_K_FUSION_QUERIES,
+        "last_customer_message": get_last_customer_message_str(state["messages"]),
+        "previous_queries": get_optional_previous_queries_str(state.get("alternative_queries")),
+    })
+    print(f"Rewritten queries: {alternative_queries.queries}")
+    return {"alternative_queries": alternative_queries}
+
+graph.add_node("rewrite_query", rewrite_query)
+
+def get_chunks(state: GraphState):
+    chunks_collector = []
+    for query in [get_last_customer_message_str(state["messages"])] + state["alternative_queries"].queries:
+        chunks_collector.extend(retriever.invoke(query))
+    chunks: ChunkArray = {chunk.page_content for chunk in chunks_collector}
+    print(f"Got {len(chunks)} chunks")
+    return {"chunks": chunks}
+
+graph.add_node("get_chunks", get_chunks)
+graph.add_edge("rewrite_query", "get_chunks")
+
+def classify_missing_info(state: GraphState):
+    missing_customer_info = missing_info_classifier_chain.invoke({
+        "messages": get_messages_str(state["messages"]),
+        "chunks": get_chunks_str(state["chunks"])
+    })
+    print(f"Classified missing info: {missing_customer_info.category}")
+    return {"missing_customer_info": missing_customer_info}
+
+graph.add_node("classify_missing_info", classify_missing_info)
+graph.add_edge("get_chunks", "classify_missing_info")
+
+def draft_response(state: GraphState):
+    previous_response_draft_or_empty = get_response_draft_str(state.get("response_draft"))
+    previous_unhelpfulness_reason_or_empty = get_unhelpful_reason_str(state.get("helpfulness_classification"))
+    response_draft = response_draft_chain.invoke({
+        "messages": get_messages_str(state["messages"]),
+        "chunks": get_chunks_str(state["chunks"]),
+        "missing_info": get_missing_info_str(state["missing_customer_info"]),
+        "response_draft": previous_response_draft_or_empty,
+        "unhelpfulness_reason": previous_unhelpfulness_reason_or_empty,
+    })
+    print(f"Drafted response: {response_draft.responseDraft}")
+    return {"response_draft": response_draft, "tries": state["tries"] + 1}
+
+graph.add_node("draft_response", draft_response)
+graph.add_edge("classify_missing_info", "draft_response")
+
+def classify_helpfulness(state: GraphState):
+    helpfulness_classification_result = helpfulness_classifier_chain.invoke({
+        "messages": get_messages_str(state["messages"]),
+        "chunks": get_chunks_str(state["chunks"]),
+        "missing_info": get_missing_info_str(state["missing_customer_info"]),
+        "response_draft": get_response_draft_str(state["response_draft"]),
+    })
+    print(f"Classified helpfulness: {helpfulness_classification_result.category}")
+    return {"helpfulness_classification": helpfulness_classification_result}
+
+graph.add_node("classify_helpfulness", classify_helpfulness)
+graph.add_edge("draft_response", "classify_helpfulness")
+
+graph.add_conditional_edges(
+    "classify_helpfulness",
+    lambda state: "classify_manual_intervention" if state["helpfulness_classification"].category == HelpfulnessClasses.NOT_HELPFUL else "send_message",
+    {
+        "classify_manual_intervention": "classify_manual_intervention",
+        "send_message": "send_message",
+    },
+)
+
+def send_message(state: GraphState):
+    print(f'Sent the customer the message "{state["response_draft"].responseDraft}"')
+    return {"messages": [f"MediVoice response: {state['response_draft'].responseDraft}"]}
+
+graph.add_node("send_message", send_message)
+graph.add_edge("send_message", "receive_customer_message")
+
+def classify_manual_intervention(state: GraphState):
+    intervention_classification_result = intervention_classifier_chain.invoke({
+        "messages": get_messages_str(state["messages"]),
+        "chunks": get_chunks_str(state["chunks"]),
+        "missing_info": get_missing_info_str(state["missing_customer_info"]),
+        "response_draft": get_response_draft_str(state["response_draft"]),
+        "unhelpfulness_reason": get_unhelpful_reason_str(state["helpfulness_classification"]),
+    })
+    print(f"Classified intervention: {intervention_classification_result.category}")
+    return {"intervention_classification": intervention_classification_result}
+
+graph.add_node("classify_manual_intervention", classify_manual_intervention)
+
+graph.add_conditional_edges(
+    "classify_manual_intervention",
+    lambda state: "classify_issue_tracker_item" if state["intervention_classification"].category == InterventionClasses.INTERVENTION or state["tries"] > RETRIES else "draft_response",
+    {
+        "classify_issue_tracker_item": "classify_issue_tracker_item",
+        "draft_response": "draft_response",
+    },
+)
+
+def classify_issue_tracker_item(state: GraphState):
+    print("""Decide issue tracker item workflow not implemented yet:
+10. issue tracker item detection:
+  * "issue tracker item needed": there should be an issue tracker item (e.g. because a MediVoice employer needs to get involved), but is not yet
+  * "no issue tracker item needed": it is not worth to create an issue tracker item for these messages, or an issue tracker tem is already present in the messages.
+
+If issue tracker item needed, goto 11, else goto 12.
+11. Create an issue tracker item, send the customer a reply with the item ID, and go to 12.
+12. If there is an issue item: {store all information in the issue item}. Terminate.""")
+    return {}
+graph.add_node("classify_issue_tracker_item", classify_issue_tracker_item)
+graph.add_edge("classify_issue_tracker_item", END)
+
+if LANGGRAPH_STUDIO:
+    graph = graph.compile(interrupt_before=['receive_customer_message'])
+else: 
+    graph = graph.compile()
+    graph.get_graph().draw_png('graph.png')
+    graph.get_graph().draw_mermaid_png(output_file_path='graph_mermaid.png')
+    graph.invoke({"messages": [], "tries": 0})

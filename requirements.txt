@@ -1,8 +1,9 @@
 langchain 
 langchain_community 
-tiktoken 
 langchainhub
-langgraph 
-langchain_openai
 langchain-chroma
+langchain_openai
+langgraph 
+python-dotenv
+tiktoken 
 unstructured

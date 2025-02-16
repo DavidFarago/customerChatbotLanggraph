@@ -1,0 +1,6 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "customer_chatbot": "./customer_chatbot.py:graph"
+  }
+}
